@@ -1,7 +1,7 @@
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
 import { presentArrivalNotification } from './notifications';
-import { setAlarmActive } from './storage';
+import { setAlarmActive, setTrackingFlag } from './storage';
 import { startAlarmSound } from './alarm';
 
 export const GEOFENCE_TASK = 'busalarm-destination-geofence';
@@ -25,6 +25,14 @@ TaskManager.defineTask(GEOFENCE_TASK, async ({ data, error }) => {
 
   if (eventType === Location.GeofencingEventType.Enter) {
     await setAlarmActive(true);
+    // One-shot: stop watching once we've arrived so the alarm doesn't re-fire
+    // if GPS drifts out of and back into the radius.
+    try {
+      await Location.stopGeofencingAsync(GEOFENCE_TASK);
+      await setTrackingFlag(false);
+    } catch (e) {
+      console.warn('Could not stop geofencing after arrival:', e);
+    }
     // Best-effort: show a loud, sticky notification immediately. This is the
     // most reliable wake-up signal when the app isn't in the foreground.
     await presentArrivalNotification();

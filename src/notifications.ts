@@ -61,5 +61,10 @@ export async function presentArrivalNotification(): Promise<void> {
 }
 
 export async function dismissArrivalNotifications(): Promise<void> {
-  await Notifications.dismissAllNotificationsAsync();
+  const presented = await Notifications.getPresentedNotificationsAsync();
+  await Promise.all(
+    presented
+      .filter((n) => n.request.content.data?.type === 'arrival-alarm')
+      .map((n) => Notifications.dismissNotificationAsync(n.request.identifier))
+  );
 }

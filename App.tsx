@@ -44,18 +44,37 @@ export default function App() {
   const [tracking, setTracking] = useState(false);
   const [alarmRinging, setAlarmRinging] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [startupErrors, setStartupErrors] = useState<string[]>([]);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
+    // Each startup step is isolated and time-limited: a failure or hang in one
+    // (e.g. a native module misbehaving) must never leave the app stuck on the
+    // loading spinner. Failures are logged (visible in `adb logcat`) and shown.
+    const errors: string[] = [];
+    const step = async <T,>(name: string, fn: () => Promise<T>, fallback: T): Promise<T> => {
+      try {
+        return await Promise.race([
+          fn(),
+          new Promise<T>((_, reject) => setTimeout(() => reject(new Error('timed out after 5s')), 5000)),
+        ]);
+      } catch (e) {
+        console.error(`[BusAlarm startup] ${name} failed:`, e);
+        errors.push(`${name}: ${e instanceof Error ? e.message : String(e)}`);
+        return fallback;
+      }
+    };
+
     (async () => {
-      await configureNotifications();
-      const dest = await loadDestination();
+      await step('configureNotifications', configureNotifications, undefined);
+      const dest = await step('loadDestination', loadDestination, null);
       if (dest) {
         setDestination(dest);
         setRadius(dest.radius);
       }
-      setTracking(await isTrackingActive());
-      setAlarmRinging(await getAlarmActive());
+      setTracking(await step('isTrackingActive', isTrackingActive, false));
+      setAlarmRinging(await step('getAlarmActive', getAlarmActive, false));
+      setStartupErrors(errors);
       setReady(true);
     })();
   }, []);
@@ -86,9 +105,18 @@ export default function App() {
     const sub = AppState.addEventListener('change', async (state) => {
       if (state === 'active') {
         setAlarmRinging(await getAlarmActive());
+        // The background task stops the geofence after it fires, so refresh.
+        setTracking(await isTrackingActive());
       }
     });
     return () => sub.remove();
+  }, []);
+
+  const handleStopAlarm = useCallback(async () => {
+    await setAlarmActive(false);
+    setAlarmRinging(false);
+    stopAlarmSound();
+    await dismissArrivalNotifications();
   }, []);
 
   // Handle the "Stop alarm" notification action button.
@@ -99,7 +127,7 @@ export default function App() {
       }
     });
     return () => sub.remove();
-  }, []);
+  }, [handleStopAlarm]);
 
   const handleSetDestinationHere = useCallback(async () => {
     setBusy(true);
@@ -179,13 +207,6 @@ export default function App() {
     setAlarmRinging(true);
   }, []);
 
-  const handleStopAlarm = useCallback(async () => {
-    await setAlarmActive(false);
-    setAlarmRinging(false);
-    stopAlarmSound();
-    await dismissArrivalNotifications();
-  }, []);
-
   useEffect(() => () => releaseAlarmSound(), []);
 
   if (!ready) {
@@ -214,6 +235,15 @@ export default function App() {
       <StatusBar style="auto" />
       <Text style={styles.title}>BusAlarm</Text>
       <Text style={styles.subtitle}>Wakes you up when you reach your stop.</Text>
+
+      {startupErrors.length > 0 && (
+        <View style={styles.errorCard}>
+          <Text style={styles.errorTitle}>Startup problems</Text>
+          {startupErrors.map((msg) => (
+            <Text key={msg} style={styles.errorText}>{msg}</Text>
+          ))}
+        </View>
+      )}
 
       <View style={styles.card}>
         <Text style={styles.cardLabel}>Destination</Text>
@@ -302,6 +332,21 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     padding: 16,
     marginBottom: 16,
+  },
+  errorCard: {
+    backgroundColor: '#3A1414',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 16,
+  },
+  errorTitle: {
+    color: '#FF8A80',
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  errorText: {
+    color: '#FFCDD2',
+    fontSize: 12,
   },
   cardLabel: {
     color: '#9AA5B1',
