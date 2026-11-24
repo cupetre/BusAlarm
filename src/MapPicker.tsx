@@ -2,8 +2,8 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef } from 
 import { StyleSheet, View } from 'react-native';
 import { WebView, type WebViewMessageEvent } from 'react-native-webview';
 
-// OpenStreetMap picker: Leaflet running inside a WebView, with free
-// OpenStreetMap-based tiles from CARTO. No API key or native map SDK needed.
+// OpenStreetMap picker: Leaflet running inside a WebView, with the standard
+// OpenStreetMap tiles. No API key or native map SDK needed.
 // Tap or long-press to drop the alarm pin, drag the pin to fine-tune it.
 
 export type LatLng = { latitude: number; longitude: number };
@@ -29,6 +29,7 @@ const html = `<!doctype html>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   html, body, #map { height: 100%; margin: 0; background: #0B1220; }
+  .dark-tiles { filter: invert(1) hue-rotate(180deg) brightness(0.9) contrast(0.9) saturate(0.6); }
   .leaflet-control-attribution { background: rgba(11,18,32,.7) !important; color: #5C6675; font-size: 9px; }
   .leaflet-control-attribution a { color: #9AA5B1; }
   .pin { width: 22px; height: 22px; border-radius: 50%; background: #FF4D3D;
@@ -38,9 +39,11 @@ const html = `<!doctype html>
 <script>
   const post = (msg) => window.ReactNativeWebView.postMessage(JSON.stringify(msg));
   const map = L.map('map', { zoomControl: false, attributionControl: true });
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    maxZoom: 19, subdomains: 'abcd',
-    attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
+  // Standard OpenStreetMap tiles (no key). The .dark-tiles CSS filter turns
+  // them into a night map that matches the app.
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, className: 'dark-tiles',
+    attribution: '&copy; OpenStreetMap contributors'
   }).addTo(map);
 
   let marker = null, circle = null, radius = 300;

@@ -6,6 +6,7 @@ import {
   AppState,
   Image,
   Keyboard,
+  Linking,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -13,7 +14,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
 
@@ -45,6 +46,7 @@ import { startArrivalSound, stopArrivalSound } from './src/arrival';
 import { MapPicker, type LatLng, type MapPickerHandle } from './src/MapPicker';
 import { searchPlaces, type Place } from './src/geocode';
 import { AlarmSoundCard } from './src/SpotifyCard';
+import { isSpotifyDeviceAvailable } from './src/spotify';
 import { colors } from './src/theme';
 
 const RADIUS_OPTIONS = [150, 300, 500];
@@ -72,6 +74,43 @@ function BusAlarm() {
   const [searching, setSearching] = useState(false);
   const mapRef = useRef<MapPickerHandle>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const sheetRef = useRef<ScrollView>(null);
+  const soundCardY = useRef(0);
+  const insets = useSafeAreaInsets();
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const [songSearchActive, setSongSearchActive] = useState(false);
+
+  // Track the keyboard ourselves: with Android's edge-to-edge layout the
+  // window no longer shrinks for the keyboard, so we pad the sheet instead.
+  useEffect(() => {
+    const show = Keyboard.addListener('keyboardDidShow', (e) => setKeyboardHeight(e.endCoordinates.height));
+    const hide = Keyboard.addListener('keyboardDidHide', () => setKeyboardHeight(0));
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, []);
+
+  // While typing a song search, fold the map away so the search box and its
+  // results get the whole screen above the keyboard.
+  const sheetExpanded = songSearchActive && keyboardHeight > 0;
+
+  const searchRowY = useRef(0);
+  const handleSongSearchFocus = useCallback((rowY: number) => {
+    searchRowY.current = rowY;
+    setSongSearchActive(true);
+  }, []);
+
+  // Once the keyboard is up and the map has folded away (so the sheet has its
+  // extra bottom space), bring the song search box to the top of the screen.
+  useEffect(() => {
+    if (!sheetExpanded) return;
+    const t = setTimeout(() => {
+      sheetRef.current?.scrollTo({ y: Math.max(0, soundCardY.current + searchRowY.current - 12), animated: true });
+    }, 60);
+    return () => clearTimeout(t);
+  }, [sheetExpanded, keyboardHeight]);
+  const handleSongSearchBlur = useCallback(() => setSongSearchActive(false), []);
 
   useEffect(() => {
     // Each startup step is isolated and time-limited: a failure or hang in one
@@ -282,6 +321,27 @@ function BusAlarm() {
           Alert.alert('Permission needed', perm.reason ?? 'Location permission was denied.');
           return;
         }
+        // Spotify can only start the song if its app is running in the
+        // background; Android won't let us launch it at arrival time.
+        if (sound.type === 'spotify' && sound.uri && !(await isSpotifyDeviceAvailable())) {
+          const choice = await new Promise<'open' | 'siren' | 'cancel'>((resolve) =>
+            Alert.alert(
+              'Spotify isn\'t running',
+              'Your song can only play if Spotify is open in the background. Open Spotify, play anything for a second, then come back and start tracking. Otherwise the siren will ring.',
+              [
+                { text: 'Cancel', style: 'cancel', onPress: () => resolve('cancel') },
+                { text: 'Use siren', onPress: () => resolve('siren') },
+                { text: 'Open Spotify', onPress: () => resolve('open') },
+              ]
+            )
+          );
+          if (choice === 'open') {
+            await Linking.openURL('spotify:').catch(() =>
+              Alert.alert('Spotify not found', 'Install or open the Spotify app first.')
+            );
+          }
+          if (choice !== 'siren') return;
+        }
         const notifGranted = await requestNotificationPermission();
         if (!notifGranted) {
           Alert.alert(
@@ -297,7 +357,7 @@ function BusAlarm() {
     } finally {
       setBusy(false);
     }
-  }, [destination, tracking]);
+  }, [destination, tracking, sound]);
 
   const handleTestAlarm = useCallback(async () => {
     await setAlarmActive(true);
@@ -340,7 +400,7 @@ function BusAlarm() {
       <StatusBar style="light" />
 
       {/* Map with the search bar floating on top */}
-      <View style={styles.mapArea}>
+      <View style={[styles.mapArea, sheetExpanded && styles.mapAreaHidden]}>
         <MapPicker
           ref={mapRef}
           pin={destination ? { latitude: destination.latitude, longitude: destination.longitude } : null}
@@ -395,9 +455,12 @@ function BusAlarm() {
       </View>
 
       {/* Settings sheet */}
+      {/* Solid strip behind the status bar while the map is folded away */}
+      {sheetExpanded && <View style={{ height: insets.top, backgroundColor: colors.bg }} />}
       <ScrollView
-        style={styles.sheet}
-        contentContainerStyle={styles.sheetContent}
+        ref={sheetRef}
+        style={[styles.sheet, sheetExpanded && { marginTop: 0, borderRadius: 0 }]}
+        contentContainerStyle={[styles.sheetContent, { paddingBottom: 40 + keyboardHeight }]}
         keyboardShouldPersistTaps="handled"
       >
         <View style={styles.handle} />
@@ -444,7 +507,14 @@ function BusAlarm() {
           <Text style={styles.hint}>Bigger circle = earlier alarm. 300 m suits a moving bus.</Text>
         </View>
 
-        <AlarmSoundCard sound={sound} onChange={setSound} />
+        <View onLayout={(e) => (soundCardY.current = e.nativeEvent.layout.y)}>
+          <AlarmSoundCard
+            sound={sound}
+            onChange={setSound}
+            onSearchFocus={handleSongSearchFocus}
+            onSearchBlur={handleSongSearchBlur}
+          />
+        </View>
 
         <Pressable
           style={[styles.primaryButton, tracking && styles.primaryButtonActive]}
@@ -471,6 +541,7 @@ const styles = StyleSheet.create({
   center: { flex: 1, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' },
 
   mapArea: { height: '46%', backgroundColor: colors.bg },
+  mapAreaHidden: { height: 0, overflow: 'hidden' },
   overlay: { position: 'absolute', top: 0, left: 0, right: 0, paddingHorizontal: 16 },
   headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 6, marginBottom: 10 },
   title: {

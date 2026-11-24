@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Image, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, Image, Keyboard, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import * as WebBrowser from 'expo-web-browser';
 import { exchangeCodeAsync, ResponseType, useAuthRequest } from 'expo-auth-session';
 
@@ -23,9 +23,13 @@ WebBrowser.maybeCompleteAuthSession();
 type Props = {
   sound: AlarmSound;
   onChange: (sound: AlarmSound) => void;
+  /** Song search focused; `y` is the search row's offset inside this card. */
+  onSearchFocus?: (y: number) => void;
+  onSearchBlur?: () => void;
 };
 
-export function AlarmSoundCard({ sound, onChange }: Props) {
+export function AlarmSoundCard({ sound, onChange, onSearchFocus, onSearchBlur }: Props) {
+  const searchRowY = useRef(0);
   const clientId = getSpotifyClientId();
   const [connected, setConnected] = useState(false);
   const [query, setQuery] = useState('');
@@ -150,7 +154,7 @@ export function AlarmSoundCard({ sound, onChange }: Props) {
                 <Text style={styles.hint}>Search for the song you want to wake up to.</Text>
               )}
 
-              <View style={styles.searchRow}>
+              <View style={styles.searchRow} onLayout={(e) => (searchRowY.current = e.nativeEvent.layout.y)}>
                 <TextInput
                   style={styles.input}
                   placeholder="Search songs"
@@ -158,6 +162,11 @@ export function AlarmSoundCard({ sound, onChange }: Props) {
                   value={query}
                   onChangeText={setQuery}
                   onSubmitEditing={runSearch}
+                  onFocus={() => onSearchFocus?.(searchRowY.current)}
+                  onBlur={() => onSearchBlur?.()}
+                  // Keep the keyboard up after searching so you can refine;
+                  // results sit right under the box, above the keyboard.
+                  submitBehavior="submit"
                   returnKeyType="search"
                 />
                 <Pressable style={styles.searchBtn} onPress={runSearch}>
@@ -170,6 +179,7 @@ export function AlarmSoundCard({ sound, onChange }: Props) {
                   key={t.uri}
                   style={styles.resultRow}
                   onPress={async () => {
+                    Keyboard.dismiss();
                     await choose({ type: 'spotify', ...t });
                     setResults([]);
                     setQuery('');
@@ -184,8 +194,8 @@ export function AlarmSoundCard({ sound, onChange }: Props) {
               ))}
 
               <Text style={styles.hint}>
-                Needs Spotify Premium. Open Spotify on your phone once before the trip. If it can't
-                play, the siren rings instead.
+                Needs Spotify Premium, and Spotify must be running in the background (don't swipe it
+                away). If it can't play, the siren rings instead.
               </Text>
               <Pressable onPress={disconnect}>
                 <Text style={styles.link}>Disconnect Spotify</Text>

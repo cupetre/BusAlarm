@@ -106,11 +106,27 @@ export async function searchTracks(query: string): Promise<SpotifyTrack[]> {
 /** Picks the phone's Spotify device, falling back to whatever is active. */
 async function findPlaybackDevice(): Promise<string | null> {
   const res = await api('/me/player/devices');
-  if (!res.ok) return null;
+  if (!res.ok) {
+    console.warn('[Spotify] /me/player/devices failed', res.status, await res.text());
+    return null;
+  }
   const { devices = [] } = await res.json();
+  console.log('[Spotify] devices:', JSON.stringify(devices.map((d: any) => ({ name: d.name, type: d.type, active: d.is_active, restricted: d.is_restricted }))));
   const phone = devices.find((d: any) => d.type === 'Smartphone');
   const active = devices.find((d: any) => d.is_active);
   return (phone ?? active ?? devices[0])?.id ?? null;
+}
+
+/**
+ * True when Spotify can currently play on some device. The phone only shows
+ * up while the Spotify app is running (not swiped away / killed by Android).
+ */
+export async function isSpotifyDeviceAvailable(): Promise<boolean> {
+  try {
+    return (await findPlaybackDevice()) !== null;
+  } catch {
+    return false;
+  }
 }
 
 /** Starts the track on this phone's Spotify. Throws if it can't. */
