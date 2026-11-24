@@ -46,14 +46,19 @@ export async function startTracking(destination: Destination): Promise<void> {
 }
 
 export async function stopTracking(): Promise<void> {
-  const already = await Location.hasStartedGeofencingAsync(GEOFENCE_TASK);
-  if (already) {
+  if (await isTrackingActive()) {
     await Location.stopGeofencingAsync(GEOFENCE_TASK);
   }
   await setTrackingFlag(false);
 }
 
+// hasStartedGeofencingAsync throws ERR_LOCATION_BACKGROUND_UNAUTHORIZED when
+// "Allow all the time" isn't granted (e.g. fresh install, or Samsung revoked it
+// while the app was in deep sleep). Without that permission no geofence can be
+// running, so treat it as "not tracking" instead of an error.
 export async function isTrackingActive(): Promise<boolean> {
+  const bg = await Location.getBackgroundPermissionsAsync();
+  if (bg.status !== 'granted') return false;
   return Location.hasStartedGeofencingAsync(GEOFENCE_TASK);
 }
 

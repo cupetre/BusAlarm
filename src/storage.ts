@@ -37,3 +37,29 @@ export async function getAlarmActive(): Promise<boolean> {
   const raw = await AsyncStorage.getItem(ALARM_ACTIVE_KEY);
   return raw === '1';
 }
+
+export type AlarmSound =
+  | { type: 'siren' }
+  | { type: 'spotify'; uri: string; name: string; artists: string; imageUrl?: string };
+
+const ALARM_SOUND_KEY = 'busalarm:alarmSound';
+const SPOTIFY_PLAYING_KEY = 'busalarm:spotifyPlaying';
+
+export async function saveAlarmSound(sound: AlarmSound): Promise<void> {
+  await AsyncStorage.setItem(ALARM_SOUND_KEY, JSON.stringify(sound));
+}
+
+export async function loadAlarmSound(): Promise<AlarmSound> {
+  const raw = await AsyncStorage.getItem(ALARM_SOUND_KEY);
+  return raw ? (JSON.parse(raw) as AlarmSound) : { type: 'siren' };
+}
+
+// Set while BusAlarm has started (or is starting) the Spotify song, so the
+// background task and the UI don't both start it, and Stop knows to pause it.
+export async function setSpotifyPlaying(isPlaying: boolean): Promise<void> {
+  await AsyncStorage.setItem(SPOTIFY_PLAYING_KEY, isPlaying ? '1' : '0');
+}
+
+export async function getSpotifyPlaying(): Promise<boolean> {
+  return (await AsyncStorage.getItem(SPOTIFY_PLAYING_KEY)) === '1';
+}

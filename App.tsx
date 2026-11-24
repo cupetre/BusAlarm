@@ -4,18 +4,25 @@ import {
   ActivityIndicator,
   Alert,
   AppState,
+  Image,
+  Keyboard,
   Pressable,
-  SafeAreaView,
+  ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from 'react-native';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
 
 import './src/geofenceTask'; // registers the background task on app startup
 import {
+  type AlarmSound,
   Destination,
   getAlarmActive,
+  loadAlarmSound,
   loadDestination,
   saveDestination,
   setAlarmActive,
@@ -33,11 +40,24 @@ import {
   requestNotificationPermission,
   STOP_ACTION_ID,
 } from './src/notifications';
-import { releaseAlarmSound, startAlarmSound, stopAlarmSound } from './src/alarm';
+import { releaseAlarmSound } from './src/alarm';
+import { startArrivalSound, stopArrivalSound } from './src/arrival';
+import { MapPicker, type LatLng, type MapPickerHandle } from './src/MapPicker';
+import { searchPlaces, type Place } from './src/geocode';
+import { AlarmSoundCard } from './src/SpotifyCard';
+import { colors } from './src/theme';
 
 const RADIUS_OPTIONS = [150, 300, 500];
 
 export default function App() {
+  return (
+    <SafeAreaProvider>
+      <BusAlarm />
+    </SafeAreaProvider>
+  );
+}
+
+function BusAlarm() {
   const [ready, setReady] = useState(false);
   const [destination, setDestination] = useState<Destination | null>(null);
   const [radius, setRadius] = useState(300);
@@ -45,6 +65,12 @@ export default function App() {
   const [alarmRinging, setAlarmRinging] = useState(false);
   const [busy, setBusy] = useState(false);
   const [startupErrors, setStartupErrors] = useState<string[]>([]);
+  const [sound, setSound] = useState<AlarmSound>({ type: 'siren' });
+  const [userCenter, setUserCenter] = useState<LatLng | undefined>();
+  const [query, setQuery] = useState('');
+  const [places, setPlaces] = useState<Place[]>([]);
+  const [searching, setSearching] = useState(false);
+  const mapRef = useRef<MapPickerHandle>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -72,29 +98,47 @@ export default function App() {
         setDestination(dest);
         setRadius(dest.radius);
       }
+      setSound(await step('loadAlarmSound', loadAlarmSound, { type: 'siren' } as AlarmSound));
       setTracking(await step('isTrackingActive', isTrackingActive, false));
       setAlarmRinging(await step('getAlarmActive', getAlarmActive, false));
+      // Centre the map near the user if we already have permission (no prompt).
+      const last = await step(
+        'lastKnownLocation',
+        async () => {
+          const perm = await Location.getForegroundPermissionsAsync();
+          return perm.granted ? Location.getLastKnownPositionAsync() : null;
+        },
+        null
+      );
+      if (last) setUserCenter({ latitude: last.coords.latitude, longitude: last.coords.longitude });
       setStartupErrors(errors);
       setReady(true);
     })();
   }, []);
 
   // While the alarm flag is set (raised by the background geofence task),
-  // make sure the foreground UI reflects it and the sound is looping.
+  // make sure the chosen sound is playing. Waits for startup so it can't
+  // stop a song the background task just started.
   useEffect(() => {
+    if (!ready) return;
     if (alarmRinging) {
-      startAlarmSound().catch(() => {});
+      startArrivalSound().catch(() => {});
     } else {
-      stopAlarmSound();
+      stopArrivalSound().catch(() => {});
     }
-  }, [alarmRinging]);
+  }, [alarmRinging, ready]);
 
-  // Poll the persisted alarm flag while the app is foregrounded/backgrounded,
-  // since the background task and the UI run as separate JS contexts.
+  // Poll the persisted alarm flag, since the background task updates it.
   useEffect(() => {
     pollRef.current = setInterval(async () => {
       const active = await getAlarmActive();
       setAlarmRinging((prev) => (prev !== active ? active : prev));
+      // The geofence is one-shot (stopped by the background task on arrival),
+      // so keep the Start/Stop tracking button in sync with reality.
+      try {
+        const isTracking = await isTrackingActive();
+        setTracking((prev) => (prev !== isTracking ? isTracking : prev));
+      } catch {}
     }, 2000);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
@@ -105,7 +149,6 @@ export default function App() {
     const sub = AppState.addEventListener('change', async (state) => {
       if (state === 'active') {
         setAlarmRinging(await getAlarmActive());
-        // The background task stops the geofence after it fires, so refresh.
         setTracking(await isTrackingActive());
       }
     });
@@ -115,19 +158,80 @@ export default function App() {
   const handleStopAlarm = useCallback(async () => {
     await setAlarmActive(false);
     setAlarmRinging(false);
-    stopAlarmSound();
+    await stopArrivalSound();
     await dismissArrivalNotifications();
   }, []);
 
   // Handle the "Stop alarm" notification action button.
   useEffect(() => {
     const sub = Notifications.addNotificationResponseReceivedListener(async (response) => {
-      if (response.actionIdentifier === STOP_ACTION_ID || response.actionIdentifier === Notifications.DEFAULT_ACTION_IDENTIFIER) {
+      if (
+        response.actionIdentifier === STOP_ACTION_ID ||
+        response.actionIdentifier === Notifications.DEFAULT_ACTION_IDENTIFIER
+      ) {
         await handleStopAlarm();
       }
     });
     return () => sub.remove();
   }, [handleStopAlarm]);
+
+  const applyDestination = useCallback(
+    async (point: LatLng, label: string) => {
+      const dest: Destination = { ...point, radius, label };
+      setDestination(dest);
+      await saveDestination(dest);
+      if (tracking) {
+        await startTracking(dest); // move the live geofence to the new pin
+      }
+    },
+    [radius, tracking]
+  );
+
+  const handleMapPick = useCallback(
+    (point: LatLng) => {
+      applyDestination(point, 'Dropped pin').catch((e) => Alert.alert('Error', String(e)));
+    },
+    [applyDestination]
+  );
+
+  const handleSearch = useCallback(async () => {
+    const q = query.trim();
+    if (!q) return;
+    Keyboard.dismiss();
+    setSearching(true);
+    try {
+      const found = await searchPlaces(q, destination ?? userCenter);
+      setPlaces(found);
+      if (found.length === 0) Alert.alert('No results', `Nothing found for "${q}".`);
+    } catch (e) {
+      Alert.alert('Search failed', String(e));
+    } finally {
+      setSearching(false);
+    }
+  }, [query, destination, userCenter]);
+
+  const handlePlace = useCallback(
+    async (place: Place) => {
+      setPlaces([]);
+      setQuery('');
+      const point = { latitude: place.latitude, longitude: place.longitude };
+      mapRef.current?.flyTo(point, 16);
+      await applyDestination(point, place.name.split(',')[0]);
+    },
+    [applyDestination]
+  );
+
+  const handleLocateMe = useCallback(async () => {
+    try {
+      const perm = await Location.requestForegroundPermissionsAsync();
+      if (!perm.granted) return;
+      const loc = await getCurrentLocation();
+      setUserCenter(loc);
+      mapRef.current?.flyTo(loc, 16);
+    } catch (e) {
+      Alert.alert('Location unavailable', String(e));
+    }
+  }, []);
 
   const handleSetDestinationHere = useCallback(async () => {
     setBusy(true);
@@ -138,21 +242,14 @@ export default function App() {
         return;
       }
       const loc = await getCurrentLocation();
-      const dest: Destination = {
-        latitude: loc.latitude,
-        longitude: loc.longitude,
-        radius,
-        label: 'My destination',
-      };
-      await saveDestination(dest);
-      setDestination(dest);
-      Alert.alert('Destination saved', 'This spot is now your alarm destination.');
+      mapRef.current?.flyTo(loc, 16);
+      await applyDestination(loc, 'My current location');
     } catch (e) {
       Alert.alert('Error', String(e));
     } finally {
       setBusy(false);
     }
-  }, [radius]);
+  }, [applyDestination]);
 
   const handleChangeRadius = useCallback(
     async (value: number) => {
@@ -171,7 +268,7 @@ export default function App() {
 
   const handleToggleTracking = useCallback(async () => {
     if (!destination) {
-      Alert.alert('Set a destination first', 'Ride the route once, then tap "Set destination = my current location" when you arrive.');
+      Alert.alert('Pick your stop first', 'Tap the map, or search for your stop, to drop the alarm pin.');
       return;
     }
     setBusy(true);
@@ -211,9 +308,9 @@ export default function App() {
 
   if (!ready) {
     return (
-      <SafeAreaView style={styles.center}>
-        <ActivityIndicator size="large" />
-      </SafeAreaView>
+      <View style={styles.center}>
+        <ActivityIndicator size="large" color={colors.accent} />
+      </View>
     );
   }
 
@@ -223,6 +320,14 @@ export default function App() {
         <StatusBar style="light" />
         <Text style={styles.alarmTitle}>You've arrived!</Text>
         <Text style={styles.alarmSubtitle}>Time to get off.</Text>
+        {sound.type === 'spotify' && sound.uri ? (
+          <View style={styles.alarmTrack}>
+            {sound.imageUrl ? <Image source={{ uri: sound.imageUrl }} style={styles.alarmArt} /> : null}
+            <Text style={styles.alarmTrackText} numberOfLines={1}>
+              {sound.name} · {sound.artists}
+            </Text>
+          </View>
+        ) : null}
         <Pressable style={styles.stopButton} onPress={handleStopAlarm}>
           <Text style={styles.stopButtonText}>STOP ALARM</Text>
         </Pressable>
@@ -231,237 +336,269 @@ export default function App() {
   }
 
   return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar style="auto" />
-      <Text style={styles.title}>BusAlarm</Text>
-      <Text style={styles.subtitle}>Wakes you up when you reach your stop.</Text>
+    <View style={styles.root}>
+      <StatusBar style="light" />
 
-      {startupErrors.length > 0 && (
-        <View style={styles.errorCard}>
-          <Text style={styles.errorTitle}>Startup problems</Text>
-          {startupErrors.map((msg) => (
-            <Text key={msg} style={styles.errorText}>{msg}</Text>
-          ))}
-        </View>
-      )}
+      {/* Map with the search bar floating on top */}
+      <View style={styles.mapArea}>
+        <MapPicker
+          ref={mapRef}
+          pin={destination ? { latitude: destination.latitude, longitude: destination.longitude } : null}
+          radius={radius}
+          onPick={handleMapPick}
+          initialCenter={userCenter}
+        />
 
-      <View style={styles.card}>
-        <Text style={styles.cardLabel}>Destination</Text>
-        {destination ? (
-          <Text style={styles.cardValue}>
-            {destination.latitude.toFixed(5)}, {destination.longitude.toFixed(5)}
-            {'\n'}Trigger radius: {destination.radius} m
-          </Text>
-        ) : (
-          <Text style={styles.cardValueMuted}>Not set yet</Text>
-        )}
-        <Pressable style={styles.secondaryButton} onPress={handleSetDestinationHere} disabled={busy}>
-          <Text style={styles.secondaryButtonText}>
-            {destination ? 'Update destination = my current location' : 'Set destination = my current location'}
-          </Text>
-        </Pressable>
-        <Text style={styles.hint}>
-          Tip: ride the bus once, and tap this button right when you get off at your usual stop.
-        </Text>
-      </View>
+        <SafeAreaView edges={['top']} style={styles.overlay} pointerEvents="box-none">
+          <View style={styles.headerRow} pointerEvents="none">
+            <Text style={styles.title}>BusAlarm</Text>
+            <View style={[styles.statusPill, tracking && styles.statusPillOn]}>
+              <View style={[styles.statusDot, tracking && styles.statusDotOn]} />
+              <Text style={styles.statusText}>{tracking ? 'Tracking' : 'Idle'}</Text>
+            </View>
+          </View>
 
-      <View style={styles.card}>
-        <Text style={styles.cardLabel}>Trigger radius</Text>
-        <View style={styles.radiusRow}>
-          {RADIUS_OPTIONS.map((r) => (
-            <Pressable
-              key={r}
-              style={[styles.radiusPill, radius === r && styles.radiusPillActive]}
-              onPress={() => handleChangeRadius(r)}
-            >
-              <Text style={[styles.radiusPillText, radius === r && styles.radiusPillTextActive]}>{r} m</Text>
+          <View style={styles.searchBar}>
+            <TextInput
+              style={styles.searchInput}
+              placeholder="Search for your stop or address"
+              placeholderTextColor={colors.muted}
+              value={query}
+              onChangeText={setQuery}
+              onSubmitEditing={handleSearch}
+              returnKeyType="search"
+            />
+            <Pressable style={styles.searchButton} onPress={handleSearch}>
+              {searching ? (
+                <ActivityIndicator color={colors.bg} size="small" />
+              ) : (
+                <Text style={styles.searchButtonText}>Go</Text>
+              )}
             </Pressable>
-          ))}
-        </View>
-        <Text style={styles.hint}>
-          Larger radius = alarm fires a bit earlier, useful on a moving bus where GPS drifts.
-        </Text>
+          </View>
+
+          {places.length > 0 && (
+            <View style={styles.results}>
+              {places.map((p) => (
+                <Pressable key={`${p.latitude},${p.longitude}`} style={styles.resultRow} onPress={() => handlePlace(p)}>
+                  <Text style={styles.resultMain} numberOfLines={1}>{p.name.split(',')[0]}</Text>
+                  <Text style={styles.resultSub} numberOfLines={1}>{p.name.split(',').slice(1).join(',').trim()}</Text>
+                </Pressable>
+              ))}
+            </View>
+          )}
+        </SafeAreaView>
+
+        <Pressable style={styles.locateButton} onPress={handleLocateMe}>
+          <View style={styles.locateIcon} />
+        </Pressable>
       </View>
 
-      <Pressable
-        style={[styles.primaryButton, tracking && styles.primaryButtonActive]}
-        onPress={handleToggleTracking}
-        disabled={busy}
+      {/* Settings sheet */}
+      <ScrollView
+        style={styles.sheet}
+        contentContainerStyle={styles.sheetContent}
+        keyboardShouldPersistTaps="handled"
       >
-        <Text style={styles.primaryButtonText}>{tracking ? 'Stop tracking' : 'Start tracking'}</Text>
-      </Pressable>
+        <View style={styles.handle} />
 
-      <Pressable style={styles.testButton} onPress={handleTestAlarm}>
-        <Text style={styles.testButtonText}>Test alarm now</Text>
-      </Pressable>
+        {startupErrors.length > 0 && (
+          <View style={styles.errorCard}>
+            <Text style={styles.errorTitle}>Startup problems</Text>
+            {startupErrors.map((msg) => (
+              <Text key={msg} style={styles.errorText}>{msg}</Text>
+            ))}
+          </View>
+        )}
 
-      <Text style={styles.footerHint}>
-        Once "Start tracking" is on, you can lock your phone or switch apps -- BusAlarm keeps watching your
-        location in the background and will ring when you're within range of your destination.
-      </Text>
-    </SafeAreaView>
+        <View style={styles.card}>
+          <Text style={styles.cardLabel}>Your stop</Text>
+          {destination ? (
+            <>
+              <Text style={styles.cardValue} numberOfLines={1}>{destination.label}</Text>
+              <Text style={styles.coords}>
+                {destination.latitude.toFixed(5)}, {destination.longitude.toFixed(5)}
+              </Text>
+            </>
+          ) : (
+            <Text style={styles.cardValueMuted}>Tap the map or search to drop the pin</Text>
+          )}
+          <Pressable style={styles.secondaryButton} onPress={handleSetDestinationHere} disabled={busy}>
+            <Text style={styles.secondaryButtonText}>Use my current location</Text>
+          </Pressable>
+        </View>
+
+        <View style={styles.card}>
+          <Text style={styles.cardLabel}>Ring when within</Text>
+          <View style={styles.radiusRow}>
+            {RADIUS_OPTIONS.map((r) => (
+              <Pressable
+                key={r}
+                style={[styles.radiusPill, radius === r && styles.radiusPillActive]}
+                onPress={() => handleChangeRadius(r)}
+              >
+                <Text style={[styles.radiusPillText, radius === r && styles.radiusPillTextActive]}>{r} m</Text>
+              </Pressable>
+            ))}
+          </View>
+          <Text style={styles.hint}>Bigger circle = earlier alarm. 300 m suits a moving bus.</Text>
+        </View>
+
+        <AlarmSoundCard sound={sound} onChange={setSound} />
+
+        <Pressable
+          style={[styles.primaryButton, tracking && styles.primaryButtonActive]}
+          onPress={handleToggleTracking}
+          disabled={busy}
+        >
+          <Text style={styles.primaryButtonText}>{tracking ? 'Stop tracking' : 'Start tracking'}</Text>
+        </Pressable>
+
+        <Pressable style={styles.testButton} onPress={handleTestAlarm}>
+          <Text style={styles.testButtonText}>Test alarm now</Text>
+        </Pressable>
+
+        <Text style={styles.footerHint}>
+          Once tracking is on you can lock your phone. BusAlarm rings when you enter the circle.
+        </Text>
+      </ScrollView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#0B1220',
-    paddingHorizontal: 20,
-    paddingTop: 24,
+  root: { flex: 1, backgroundColor: colors.bg },
+  center: { flex: 1, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' },
+
+  mapArea: { height: '46%', backgroundColor: colors.bg },
+  overlay: { position: 'absolute', top: 0, left: 0, right: 0, paddingHorizontal: 16 },
+  headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 6, marginBottom: 10 },
+  title: {
+    fontSize: 26,
+    fontWeight: '800',
+    color: colors.text,
+    textShadowColor: 'rgba(0,0,0,0.8)',
+    textShadowRadius: 8,
   },
-  center: {
-    flex: 1,
-    backgroundColor: '#0B1220',
+  statusPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: 'rgba(20,28,44,0.9)',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  statusPillOn: { backgroundColor: 'rgba(46,204,113,0.2)' },
+  statusDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.faint },
+  statusDotOn: { backgroundColor: colors.go },
+  statusText: { color: colors.text, fontWeight: '700', fontSize: 12 },
+
+  searchBar: {
+    flexDirection: 'row',
+    backgroundColor: 'rgba(20,28,44,0.96)',
+    borderRadius: 14,
+    padding: 5,
+    gap: 6,
+    shadowColor: '#000',
+    shadowOpacity: 0.4,
+    shadowRadius: 10,
+    elevation: 6,
+  },
+  searchInput: { flex: 1, color: colors.text, paddingHorizontal: 10, fontSize: 15 },
+  searchButton: {
+    backgroundColor: colors.accent,
+    borderRadius: 10,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    justifyContent: 'center',
+    alignItems: 'center',
+    minWidth: 52,
+  },
+  searchButtonText: { color: colors.bg, fontWeight: '800' },
+  results: { backgroundColor: 'rgba(20,28,44,0.98)', borderRadius: 14, marginTop: 6, overflow: 'hidden', elevation: 6 },
+  resultRow: { paddingHorizontal: 14, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: colors.cardAlt },
+  resultMain: { color: colors.text, fontWeight: '600' },
+  resultSub: { color: colors.muted, fontSize: 12, marginTop: 2 },
+
+  locateButton: {
+    position: 'absolute',
+    right: 16,
+    bottom: 30,
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: 'rgba(20,28,44,0.96)',
     alignItems: 'center',
     justifyContent: 'center',
+    elevation: 6,
   },
-  title: {
-    fontSize: 30,
-    fontWeight: '800',
-    color: '#fff',
-  },
-  subtitle: {
-    fontSize: 14,
-    color: '#9AA5B1',
-    marginTop: 4,
-    marginBottom: 20,
-  },
-  card: {
-    backgroundColor: '#141C2C',
-    borderRadius: 16,
-    padding: 16,
-    marginBottom: 16,
-  },
-  errorCard: {
-    backgroundColor: '#3A1414',
-    borderRadius: 12,
-    padding: 12,
-    marginBottom: 16,
-  },
-  errorTitle: {
-    color: '#FF8A80',
-    fontWeight: '700',
-    marginBottom: 4,
-  },
-  errorText: {
-    color: '#FFCDD2',
-    fontSize: 12,
-  },
-  cardLabel: {
-    color: '#9AA5B1',
-    fontSize: 12,
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-    marginBottom: 8,
-  },
-  cardValue: {
-    color: '#fff',
-    fontSize: 16,
-    marginBottom: 12,
-  },
-  cardValueMuted: {
-    color: '#5C6675',
-    fontSize: 16,
-    marginBottom: 12,
-    fontStyle: 'italic',
-  },
-  secondaryButton: {
-    backgroundColor: '#1E2A40',
-    borderRadius: 10,
-    paddingVertical: 12,
-    alignItems: 'center',
-  },
-  secondaryButtonText: {
-    color: '#4FA3FF',
-    fontWeight: '600',
-  },
-  hint: {
-    color: '#5C6675',
-    fontSize: 12,
-    marginTop: 8,
-  },
-  radiusRow: {
-    flexDirection: 'row',
-    gap: 10,
-  },
-  radiusPill: {
+  locateIcon: { width: 16, height: 16, borderRadius: 8, borderWidth: 3, borderColor: colors.accent },
+
+  sheet: {
     flex: 1,
-    paddingVertical: 10,
-    borderRadius: 10,
-    backgroundColor: '#1E2A40',
-    alignItems: 'center',
+    backgroundColor: colors.bg,
+    marginTop: -18,
+    borderTopLeftRadius: 22,
+    borderTopRightRadius: 22,
   },
-  radiusPillActive: {
-    backgroundColor: '#4FA3FF',
-  },
-  radiusPillText: {
-    color: '#9AA5B1',
-    fontWeight: '600',
-  },
-  radiusPillTextActive: {
-    color: '#0B1220',
-  },
-  primaryButton: {
-    backgroundColor: '#2ECC71',
-    borderRadius: 14,
-    paddingVertical: 16,
-    alignItems: 'center',
-    marginBottom: 12,
-  },
-  primaryButtonActive: {
-    backgroundColor: '#E74C3C',
-  },
-  primaryButtonText: {
-    color: '#0B1220',
-    fontWeight: '800',
-    fontSize: 16,
-  },
+  sheetContent: { paddingHorizontal: 16, paddingBottom: 40 },
+  handle: { alignSelf: 'center', width: 40, height: 4, borderRadius: 2, backgroundColor: colors.cardAlt, marginVertical: 10 },
+
+  card: { backgroundColor: colors.card, borderRadius: 18, padding: 16, marginBottom: 14 },
+  cardLabel: { color: colors.muted, fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 8 },
+  cardValue: { color: colors.text, fontSize: 17, fontWeight: '700' },
+  coords: { color: colors.faint, fontSize: 12, marginTop: 2, marginBottom: 12 },
+  cardValueMuted: { color: colors.faint, fontSize: 15, marginBottom: 12, fontStyle: 'italic' },
+  secondaryButton: { backgroundColor: colors.cardAlt, borderRadius: 10, paddingVertical: 11, alignItems: 'center' },
+  secondaryButtonText: { color: colors.accent, fontWeight: '600' },
+  hint: { color: colors.faint, fontSize: 12, marginTop: 10 },
+
+  radiusRow: { flexDirection: 'row', gap: 10 },
+  radiusPill: { flex: 1, paddingVertical: 10, borderRadius: 10, backgroundColor: colors.cardAlt, alignItems: 'center' },
+  radiusPillActive: { backgroundColor: colors.pin },
+  radiusPillText: { color: colors.muted, fontWeight: '700' },
+  radiusPillTextActive: { color: colors.text },
+
+  primaryButton: { backgroundColor: colors.go, borderRadius: 16, paddingVertical: 17, alignItems: 'center', marginBottom: 12 },
+  primaryButtonActive: { backgroundColor: colors.danger },
+  primaryButtonText: { color: colors.bg, fontWeight: '800', fontSize: 17 },
   testButton: {
-    borderRadius: 14,
+    borderRadius: 16,
     paddingVertical: 14,
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: '#2C3A52',
-    marginBottom: 20,
+    borderColor: colors.cardAlt,
+    marginBottom: 16,
   },
-  testButtonText: {
-    color: '#9AA5B1',
-    fontWeight: '600',
-  },
-  footerHint: {
-    color: '#5C6675',
-    fontSize: 12,
-    textAlign: 'center',
-  },
+  testButtonText: { color: colors.muted, fontWeight: '600' },
+  footerHint: { color: colors.faint, fontSize: 12, textAlign: 'center' },
+
+  errorCard: { backgroundColor: '#3A1414', borderRadius: 12, padding: 12, marginBottom: 14 },
+  errorTitle: { color: '#FF8A80', fontWeight: '700', marginBottom: 4 },
+  errorText: { color: '#FFCDD2', fontSize: 12 },
+
   alarmContainer: {
     flex: 1,
-    backgroundColor: '#E74C3C',
+    backgroundColor: colors.danger,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 24,
   },
-  alarmTitle: {
-    fontSize: 36,
-    fontWeight: '800',
-    color: '#fff',
-    marginBottom: 8,
-    textAlign: 'center',
-  },
-  alarmSubtitle: {
-    fontSize: 18,
-    color: '#FFE5E0',
-    marginBottom: 48,
-  },
-  stopButton: {
-    backgroundColor: '#fff',
+  alarmTitle: { fontSize: 36, fontWeight: '800', color: '#fff', marginBottom: 8, textAlign: 'center' },
+  alarmSubtitle: { fontSize: 18, color: '#FFE5E0', marginBottom: 28 },
+  alarmTrack: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: 'rgba(0,0,0,0.2)',
     borderRadius: 999,
-    paddingVertical: 22,
-    paddingHorizontal: 48,
+    paddingRight: 16,
+    marginBottom: 36,
+    maxWidth: '100%',
   },
-  stopButtonText: {
-    color: '#E74C3C',
-    fontWeight: '800',
-    fontSize: 20,
-  },
+  alarmArt: { width: 40, height: 40, borderRadius: 20 },
+  alarmTrackText: { color: '#fff', fontWeight: '600', flexShrink: 1 },
+  stopButton: { backgroundColor: '#fff', borderRadius: 999, paddingVertical: 22, paddingHorizontal: 48 },
+  stopButtonText: { color: colors.danger, fontWeight: '800', fontSize: 20 },
 });

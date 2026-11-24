@@ -56,7 +56,9 @@ export async function presentArrivalNotification(): Promise<void> {
       autoDismiss: false,
       data: { type: 'arrival-alarm' },
     },
-    trigger: null,
+    // On Android a `null` trigger posts to Expo's silent fallback channel;
+    // naming our channel is what gives the notification its siren + vibration.
+    trigger: Platform.OS === 'android' ? { channelId: ALARM_CHANNEL_ID } : null,
   });
 }
 
@@ -64,7 +66,16 @@ export async function dismissArrivalNotifications(): Promise<void> {
   const presented = await Notifications.getPresentedNotificationsAsync();
   await Promise.all(
     presented
-      .filter((n) => n.request.content.data?.type === 'arrival-alarm')
+      // Match on several fields: on Android the `data` payload isn't always
+      // round-tripped on presented notifications, so data.type alone missed it.
+      .filter((n) => {
+        const { content, trigger } = n.request;
+        return (
+          content.data?.type === 'arrival-alarm' ||
+          content.title === "You've arrived" ||
+          (trigger as { channelId?: string } | null)?.channelId === ALARM_CHANNEL_ID
+        );
+      })
       .map((n) => Notifications.dismissNotificationAsync(n.request.identifier))
   );
 }

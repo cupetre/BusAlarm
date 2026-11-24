@@ -4,6 +4,7 @@
     "slug": "BusAlarm",
     "version": "1.0.0",
     "orientation": "portrait",
+    "scheme": "busalarm",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
@@ -35,7 +36,7 @@
         "WAKE_LOCK",
         "RECEIVE_BOOT_COMPLETED"
       ],
-      "versionCode": 3
+      "versionCode": 5
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -59,9 +60,17 @@
           ]
         }
       ],
-      "expo-asset"
+      "expo-asset",
+      "expo-web-browser",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": false
+        }
+      ]
     ],
     "extra": {
+      "spotifyClientId": "75f4a2ec21a84e8191b76d93b3d83fdc",
       "eas": {
         "projectId": "b858d83c-a836-4be8-befe-4c40c8505b55"
       }

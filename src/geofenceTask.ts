@@ -2,7 +2,7 @@ import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
 import { presentArrivalNotification } from './notifications';
 import { setAlarmActive, setTrackingFlag } from './storage';
-import { startAlarmSound } from './alarm';
+import { startArrivalSound } from './arrival';
 
 export const GEOFENCE_TASK = 'busalarm-destination-geofence';
 
@@ -40,7 +40,7 @@ TaskManager.defineTask(GEOFENCE_TASK, async ({ data, error }) => {
     // when the app is open or recently backgrounded; if the OS has fully
     // suspended the JS runtime, the notification above is the fallback.
     try {
-      await startAlarmSound();
+      await startArrivalSound();
     } catch (e) {
       console.warn('Could not start alarm sound from background task:', e);
     }
